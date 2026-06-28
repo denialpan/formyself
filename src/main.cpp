@@ -1601,6 +1601,52 @@ void ApplyStyle() {
     style.TabRounding = 0.0f;
 }
 
+void SetWindowIcon(GLFWwindow* window) {
+    constexpr int size = 32;
+    std::array<unsigned char, size * size * 4> pixels{};
+
+    auto set_pixel = [&](int x, int y, unsigned char r, unsigned char g, unsigned char b, unsigned char a) {
+        if (x < 0 || x >= size || y < 0 || y >= size) {
+            return;
+        }
+        const size_t index = static_cast<size_t>((y * size + x) * 4);
+        pixels[index + 0] = r;
+        pixels[index + 1] = g;
+        pixels[index + 2] = b;
+        pixels[index + 3] = a;
+    };
+
+    auto fill_rect = [&](int x, int y, int width, int height, unsigned char r, unsigned char g, unsigned char b, unsigned char a) {
+        for (int yy = y; yy < y + height; ++yy) {
+            for (int xx = x; xx < x + width; ++xx) {
+                set_pixel(xx, yy, r, g, b, a);
+            }
+        }
+    };
+
+    fill_rect(8, 6, 16, 22, 0, 0, 0, 110);
+    fill_rect(6, 4, 18, 22, 245, 245, 238, 255);
+    fill_rect(22, 6, 2, 20, 185, 185, 178, 255);
+    fill_rect(8, 26, 16, 2, 155, 155, 150, 255);
+    fill_rect(6, 4, 18, 4, 75, 148, 210, 255);
+    fill_rect(6, 8, 18, 2, 42, 92, 145, 255);
+
+    for (int x : {8, 12, 16, 20}) {
+        fill_rect(x, 4, 2, 2, 28, 28, 28, 255);
+    }
+
+    fill_rect(10, 12, 10, 2, 55, 55, 55, 255);
+    fill_rect(10, 16, 8, 2, 55, 55, 55, 255);
+    fill_rect(10, 20, 10, 2, 55, 55, 55, 255);
+
+    GLFWimage image{
+        size,
+        size,
+        pixels.data(),
+    };
+    glfwSetWindowIcon(window, 1, &image);
+}
+
 } // namespace
 
 int main() {
@@ -1624,6 +1670,7 @@ int main() {
         glfwTerminate();
         return 1;
     }
+    SetWindowIcon(window);
 
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1);

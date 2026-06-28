@@ -49,6 +49,7 @@ target_include_directories(argon2_ref PUBLIC
 
 add_executable(imgui_text_editor
     src/main.cpp
+    src/app_icon.rc
     ${imgui_SOURCE_DIR}/imgui.cpp
     ${imgui_SOURCE_DIR}/imgui_draw.cpp
     ${imgui_SOURCE_DIR}/imgui_tables.cpp
