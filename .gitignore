@@ -1,0 +1,7 @@
+/build/
+/build-release/
+/cmake-build-debug/
+/dist/
+/target/
+/.idea/
+editor_config.ini
