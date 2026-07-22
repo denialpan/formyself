@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <cwchar>
 #include <cstring>
+#include <cctype>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -29,6 +30,8 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -49,6 +52,8 @@ enum class EditorCommand {
     Paste,
     InsertText,
     SelectAll,
+    FindNext,
+    FindPrevious,
 };
 
 enum class PasswordPromptMode {
@@ -69,9 +74,18 @@ struct AppConfig {
     bool generated_use_special = true;
 };
 
+struct EditorSnapshot {
+    std::string text;
+    int cursor_pos = 0;
+    int selection_start = 0;
+    int selection_end = 0;
+    bool has_selection = false;
+};
+
 struct Document {
     std::string text;
     std::string saved_text;
+    std::vector<std::string> lines{""};
     std::vector<size_t> line_offsets{0};
     size_t saved_revision = 0;
     size_t edit_revision = 0;
@@ -79,12 +93,19 @@ struct Document {
     void RebuildLineIndex() {
         line_offsets.clear();
         line_offsets.push_back(0);
+        lines.clear();
+
+        size_t line_start = 0;
 
         for (size_t i = 0; i < text.size(); ++i) {
             if (text[i] == '\n') {
                 line_offsets.push_back(i + 1);
+                lines.push_back(text.substr(line_start, i - line_start));
+                line_start = i + 1;
             }
         }
+
+        lines.push_back(text.substr(line_start));
     }
 
     void SetText(std::string contents) {
@@ -117,12 +138,29 @@ struct Document {
     }
 
     int LineCount() const {
-        return static_cast<int>(line_offsets.empty() ? 1 : line_offsets.size());
+        return static_cast<int>(lines.empty() ? 1 : lines.size());
     }
 
     size_t LineStart(int one_based_line) const {
         const int line = std::clamp(one_based_line, 1, LineCount());
         return line_offsets[static_cast<size_t>(line - 1)];
+    }
+
+    size_t LineStartByIndex(size_t line_index) const {
+        if (line_offsets.empty()) {
+            return 0;
+        }
+        return line_offsets[(std::min)(line_index, line_offsets.size() - 1)];
+    }
+
+    size_t PositionFromLineColumn(size_t line_index, size_t column) const {
+        if (lines.empty()) {
+            return 0;
+        }
+
+        const size_t clamped_line = (std::min)(line_index, lines.size() - 1);
+        const size_t clamped_column = (std::min)(column, lines[clamped_line].size());
+        return LineStartByIndex(clamped_line) + clamped_column;
     }
 
     void CursorLineColumn(size_t cursor_pos, int& line, int& column) const {
@@ -134,6 +172,30 @@ struct Document {
 
         line = static_cast<int>(line_index) + 1;
         column = static_cast<int>(clamped - line_offsets[line_index]) + 1;
+    }
+
+    std::pair<size_t, size_t> LineColumnFromPosition(size_t cursor_pos) const {
+        int line = 1;
+        int column = 1;
+        CursorLineColumn(cursor_pos, line, column);
+        return {
+            static_cast<size_t>((std::max)(0, line - 1)),
+            static_cast<size_t>((std::max)(0, column - 1)),
+        };
+    }
+
+    void Insert(size_t position, std::string_view inserted_text) {
+        text.insert((std::min)(position, text.size()), inserted_text.data(), inserted_text.size());
+        MarkEdited();
+    }
+
+    void Erase(size_t position, size_t length) {
+        if (position >= text.size() || length == 0) {
+            return;
+        }
+
+        text.erase(position, (std::min)(length, text.size() - position));
+        MarkEdited();
     }
 };
 
@@ -152,12 +214,16 @@ struct EditorState {
     size_t visual_metrics_revision = (std::numeric_limits<size_t>::max)();
     float visual_metrics_wrap_width = -1.0f;
     bool visual_metrics_word_wrap = false;
-    std::vector<std::string> undo_stack;
-    std::vector<std::string> redo_stack;
+    std::vector<EditorSnapshot> undo_stack;
+    std::vector<EditorSnapshot> redo_stack;
     int selection_start = 0;
     int selection_end = 0;
     int cursor_pos = 0;
     bool has_selection = false;
+    bool editor_focused = false;
+    size_t desired_column = 0;
+    size_t mouse_selection_anchor = 0;
+    bool dragging_selection = false;
     int cursor_line = 1;
     int cursor_column = 1;
     PendingAction pending_action = PendingAction::None;
@@ -176,8 +242,21 @@ struct EditorState {
     bool generated_use_lowercase = true;
     bool generated_use_numbers = true;
     bool generated_use_special = true;
+    bool show_find_window = false;
+    std::array<char, 256> find_buffer{};
+    bool find_match_case = false;
+    bool find_wrap = true;
+    size_t active_find_start = std::string::npos;
+    size_t active_find_end = std::string::npos;
     bool show_unsaved_prompt = false;
     bool close_after_frame = false;
+};
+
+struct VisualRow {
+    int line = 0;
+    size_t start = 0;
+    size_t end = 0;
+    float y = 0.0f;
 };
 
 struct InputCallbackState {
@@ -609,6 +688,12 @@ void ClearDocument(EditorState& editor) {
     editor.selection_end = 0;
     editor.cursor_pos = 0;
     editor.has_selection = false;
+    editor.editor_focused = false;
+    editor.desired_column = 0;
+    editor.mouse_selection_anchor = 0;
+    editor.dragging_selection = false;
+    editor.active_find_start = std::string::npos;
+    editor.active_find_end = std::string::npos;
     editor.cursor_line = 1;
     editor.cursor_column = 1;
     editor.editor_scroll_y = 0.0f;
@@ -621,6 +706,12 @@ void ResetEditingSession(EditorState& editor) {
     editor.selection_end = 0;
     editor.cursor_pos = 0;
     editor.has_selection = false;
+    editor.editor_focused = false;
+    editor.desired_column = 0;
+    editor.mouse_selection_anchor = 0;
+    editor.dragging_selection = false;
+    editor.active_find_start = std::string::npos;
+    editor.active_find_end = std::string::npos;
     editor.cursor_line = 1;
     editor.cursor_column = 1;
     editor.editor_scroll_y = 0.0f;
@@ -776,33 +867,37 @@ void QueueEditorCommand(EditorState& editor, EditorCommand command) {
     editor.pending_editor_command = command;
 }
 
-void RecordUndoSnapshot(EditorState& editor, const std::string& snapshot) {
-    if (editor.undo_stack.empty() || editor.undo_stack.back() != snapshot) {
+EditorSnapshot MakeEditorSnapshot(const EditorState& editor) {
+    return EditorSnapshot{
+        editor.document.text,
+        editor.cursor_pos,
+        editor.selection_start,
+        editor.selection_end,
+        editor.has_selection,
+    };
+}
+
+bool SameSnapshot(const EditorSnapshot& left, const EditorSnapshot& right) {
+    return left.text == right.text &&
+        left.cursor_pos == right.cursor_pos &&
+        left.selection_start == right.selection_start &&
+        left.selection_end == right.selection_end &&
+        left.has_selection == right.has_selection;
+}
+
+void PushUndoSnapshot(EditorState& editor, const EditorSnapshot& snapshot) {
+    if (editor.undo_stack.empty() || !SameSnapshot(editor.undo_stack.back(), snapshot)) {
         constexpr size_t max_undo_entries = 100;
         editor.undo_stack.push_back(snapshot);
         if (editor.undo_stack.size() > max_undo_entries) {
             editor.undo_stack.erase(editor.undo_stack.begin());
         }
     }
+}
+
+void RecordUndoSnapshot(EditorState& editor) {
+    PushUndoSnapshot(editor, MakeEditorSnapshot(editor));
     editor.redo_stack.clear();
-}
-
-void ReloadInputStateWithCursor(ImGuiInputTextState* state, int cursor_pos) {
-    if (state == nullptr) {
-        return;
-    }
-
-    state->WantReloadUserBuf = true;
-    state->ReloadSelectionStart = cursor_pos;
-    state->ReloadSelectionEnd = cursor_pos;
-    state->CursorAnimReset();
-}
-
-void SetDocumentTextFromCommand(EditorState& editor, std::string text, int cursor_pos, ImGuiInputTextState* state) {
-    editor.document.SetText(std::move(text));
-    ReloadInputStateWithCursor(state, cursor_pos);
-    UpdateCursorPosition(editor, cursor_pos);
-    editor.status = "Editing";
 }
 
 std::pair<int, int> NormalizedSelection(const EditorState& editor) {
@@ -815,6 +910,329 @@ std::pair<int, int> NormalizedSelection(const EditorState& editor) {
     selection_start = std::clamp(selection_start, 0, static_cast<int>(editor.document.text.size()));
     selection_end = std::clamp(selection_end, 0, static_cast<int>(editor.document.text.size()));
     return {selection_start, selection_end};
+}
+
+bool HasSelection(const EditorState& editor) {
+    const auto [selection_start, selection_end] = NormalizedSelection(editor);
+    return editor.has_selection && selection_start != selection_end;
+}
+
+size_t ClampDocumentPosition(const EditorState& editor, size_t position) {
+    return (std::min)(position, editor.document.text.size());
+}
+
+void ClearSelection(EditorState& editor) {
+    editor.selection_start = editor.cursor_pos;
+    editor.selection_end = editor.cursor_pos;
+    editor.has_selection = false;
+}
+
+void SetCursorPosition(EditorState& editor, size_t position, bool preserve_desired_column = false) {
+    const size_t clamped = ClampDocumentPosition(editor, position);
+    UpdateCursorPosition(editor, static_cast<int>(clamped));
+    if (!preserve_desired_column) {
+        const auto [line, column] = editor.document.LineColumnFromPosition(clamped);
+        (void)line;
+        editor.desired_column = column;
+    }
+}
+
+void ApplyEditorSnapshot(EditorState& editor, const EditorSnapshot& snapshot) {
+    editor.document.SetText(snapshot.text);
+    const int text_size = static_cast<int>(editor.document.text.size());
+    editor.selection_start = std::clamp(snapshot.selection_start, 0, text_size);
+    editor.selection_end = std::clamp(snapshot.selection_end, 0, text_size);
+    editor.has_selection = snapshot.has_selection && editor.selection_start != editor.selection_end;
+    SetCursorPosition(editor, static_cast<size_t>(std::clamp(snapshot.cursor_pos, 0, text_size)));
+    if (!editor.has_selection) {
+        ClearSelection(editor);
+    }
+}
+
+void SetSelection(EditorState& editor, size_t anchor, size_t cursor, bool preserve_desired_column = false) {
+    const size_t clamped_anchor = ClampDocumentPosition(editor, anchor);
+    const size_t clamped_cursor = ClampDocumentPosition(editor, cursor);
+    editor.selection_start = static_cast<int>(clamped_anchor);
+    editor.selection_end = static_cast<int>(clamped_cursor);
+    editor.has_selection = clamped_anchor != clamped_cursor;
+    SetCursorPosition(editor, clamped_cursor, preserve_desired_column);
+}
+
+void MoveCursorTo(EditorState& editor, size_t position, bool selecting, bool preserve_desired_column = false) {
+    const size_t previous_cursor = static_cast<size_t>(editor.cursor_pos);
+    if (selecting) {
+        const size_t anchor = editor.has_selection
+            ? static_cast<size_t>(editor.selection_start)
+            : previous_cursor;
+        SetSelection(editor, anchor, position, preserve_desired_column);
+        return;
+    }
+
+    SetCursorPosition(editor, position, preserve_desired_column);
+    ClearSelection(editor);
+}
+
+bool IsUtf8Continuation(unsigned char c) {
+    return (c & 0xc0) == 0x80;
+}
+
+size_t PreviousCharacterPosition(const std::string& text, size_t position) {
+    if (position == 0) {
+        return 0;
+    }
+
+    --position;
+    while (position > 0 && IsUtf8Continuation(static_cast<unsigned char>(text[position]))) {
+        --position;
+    }
+    return position;
+}
+
+size_t NextCharacterPosition(const std::string& text, size_t position) {
+    if (position >= text.size()) {
+        return text.size();
+    }
+
+    ++position;
+    while (position < text.size() && IsUtf8Continuation(static_cast<unsigned char>(text[position]))) {
+        ++position;
+    }
+    return position;
+}
+
+bool DeleteSelection(EditorState& editor) {
+    if (!HasSelection(editor)) {
+        return false;
+    }
+
+    const auto [selection_start, selection_end] = NormalizedSelection(editor);
+    editor.document.Erase(
+        static_cast<size_t>(selection_start),
+        static_cast<size_t>(selection_end - selection_start));
+    SetCursorPosition(editor, static_cast<size_t>(selection_start));
+    ClearSelection(editor);
+    editor.status = "Editing";
+    editor.last_action = "Modified";
+    return true;
+}
+
+void InsertTextAtCursor(EditorState& editor, const std::string& inserted_text, const char* action) {
+    if (inserted_text.empty()) {
+        return;
+    }
+
+    RecordUndoSnapshot(editor);
+    size_t position = static_cast<size_t>(editor.cursor_pos);
+    if (HasSelection(editor)) {
+        const auto [selection_start, selection_end] = NormalizedSelection(editor);
+        editor.document.Erase(
+            static_cast<size_t>(selection_start),
+            static_cast<size_t>(selection_end - selection_start));
+        position = static_cast<size_t>(selection_start);
+    }
+
+    editor.document.Insert(position, inserted_text);
+    SetCursorPosition(editor, position + inserted_text.size());
+    ClearSelection(editor);
+    editor.status = "Editing";
+    editor.last_action = action;
+}
+
+void DeleteBackward(EditorState& editor) {
+    if (HasSelection(editor)) {
+        RecordUndoSnapshot(editor);
+        DeleteSelection(editor);
+        return;
+    }
+
+    if (DeleteSelection(editor)) {
+        return;
+    }
+
+    const size_t cursor = static_cast<size_t>(editor.cursor_pos);
+    const size_t previous = PreviousCharacterPosition(editor.document.text, cursor);
+    if (previous == cursor) {
+        return;
+    }
+
+    RecordUndoSnapshot(editor);
+    editor.document.Erase(previous, cursor - previous);
+    SetCursorPosition(editor, previous);
+    ClearSelection(editor);
+    editor.status = "Editing";
+    editor.last_action = "Backspace";
+}
+
+void DeleteForward(EditorState& editor) {
+    if (HasSelection(editor)) {
+        RecordUndoSnapshot(editor);
+        DeleteSelection(editor);
+        return;
+    }
+
+    if (DeleteSelection(editor)) {
+        return;
+    }
+
+    const size_t cursor = static_cast<size_t>(editor.cursor_pos);
+    const size_t next = NextCharacterPosition(editor.document.text, cursor);
+    if (next == cursor) {
+        return;
+    }
+
+    RecordUndoSnapshot(editor);
+    editor.document.Erase(cursor, next - cursor);
+    SetCursorPosition(editor, cursor);
+    ClearSelection(editor);
+    editor.status = "Editing";
+    editor.last_action = "Delete";
+}
+
+void CopySelection(EditorState& editor) {
+    if (!HasSelection(editor)) {
+        return;
+    }
+
+    const auto [selection_start, selection_end] = NormalizedSelection(editor);
+    ImGui::SetClipboardText(editor.document.text.substr(
+        static_cast<size_t>(selection_start),
+        static_cast<size_t>(selection_end - selection_start)).c_str());
+    editor.status = "Copied";
+    editor.last_action = "Copied";
+}
+
+void CutSelection(EditorState& editor) {
+    if (!HasSelection(editor)) {
+        return;
+    }
+
+    CopySelection(editor);
+    RecordUndoSnapshot(editor);
+    DeleteSelection(editor);
+    editor.last_action = "Cut";
+}
+
+void PasteClipboard(EditorState& editor) {
+    InsertTextAtCursor(editor, NormalizePlainText(ImGui::GetClipboardText()), "Pasted");
+}
+
+bool EditorInputBlockedByDialog(const EditorState& editor) {
+    return editor.show_find_window ||
+        editor.show_password_generator ||
+        editor.show_unsaved_prompt ||
+        editor.show_password_prompt ||
+        editor.password_prompt_mode != PasswordPromptMode::None ||
+        ImGui::IsPopupOpen("Unsaved changes") ||
+        ImGui::IsPopupOpen("File password") ||
+        ImGui::IsPopupOpen("Password generator");
+}
+
+char FoldSearchChar(char value) {
+    return static_cast<char>(std::tolower(static_cast<unsigned char>(value)));
+}
+
+bool SearchMatchesAt(const std::string& text, const std::string& needle, size_t position, bool match_case) {
+    if (position + needle.size() > text.size()) {
+        return false;
+    }
+
+    for (size_t i = 0; i < needle.size(); ++i) {
+        const char left = text[position + i];
+        const char right = needle[i];
+        if (match_case ? left != right : FoldSearchChar(left) != FoldSearchChar(right)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+size_t FindForwardFrom(const std::string& text, const std::string& needle, size_t start, bool match_case) {
+    if (needle.empty() || text.empty() || needle.size() > text.size()) {
+        return std::string::npos;
+    }
+
+    start = (std::min)(start, text.size());
+    for (size_t position = start; position + needle.size() <= text.size(); ++position) {
+        if (SearchMatchesAt(text, needle, position, match_case)) {
+            return position;
+        }
+    }
+
+    return std::string::npos;
+}
+
+size_t FindBackwardFrom(const std::string& text, const std::string& needle, size_t start, bool match_case) {
+    if (needle.empty() || text.empty() || needle.size() > text.size()) {
+        return std::string::npos;
+    }
+
+    size_t position = (std::min)(start, text.size() - needle.size());
+    for (;;) {
+        if (SearchMatchesAt(text, needle, position, match_case)) {
+            return position;
+        }
+        if (position == 0) {
+            break;
+        }
+        --position;
+    }
+
+    return std::string::npos;
+}
+
+void ClearActiveFindMatch(EditorState& editor) {
+    editor.active_find_start = std::string::npos;
+    editor.active_find_end = std::string::npos;
+}
+
+void SelectFindMatch(EditorState& editor, size_t position, size_t length, const char* action) {
+    editor.active_find_start = position;
+    editor.active_find_end = position + length;
+    SetSelection(editor, position, position + length);
+    editor.editor_focused = true;
+    editor.status = "Found match";
+    editor.last_action = action;
+}
+
+bool FindInDocument(EditorState& editor, bool forward) {
+    const std::string needle = editor.find_buffer.data();
+    if (needle.empty()) {
+        ClearActiveFindMatch(editor);
+        editor.show_find_window = true;
+        editor.status = "Enter search text";
+        editor.last_action = "Find";
+        return false;
+    }
+
+    size_t found = std::string::npos;
+    if (forward) {
+        const size_t start = HasSelection(editor)
+            ? static_cast<size_t>(NormalizedSelection(editor).second)
+            : static_cast<size_t>(editor.cursor_pos);
+        found = FindForwardFrom(editor.document.text, needle, start, editor.find_match_case);
+        if (found == std::string::npos && editor.find_wrap) {
+            found = FindForwardFrom(editor.document.text, needle, 0, editor.find_match_case);
+        }
+    } else {
+        const size_t start = HasSelection(editor)
+            ? static_cast<size_t>(NormalizedSelection(editor).first == 0 ? 0 : NormalizedSelection(editor).first - 1)
+            : static_cast<size_t>(editor.cursor_pos == 0 ? 0 : editor.cursor_pos - 1);
+        found = FindBackwardFrom(editor.document.text, needle, start, editor.find_match_case);
+        if (found == std::string::npos && editor.find_wrap && !editor.document.text.empty()) {
+            found = FindBackwardFrom(editor.document.text, needle, editor.document.text.size() - 1, editor.find_match_case);
+        }
+    }
+
+    if (found == std::string::npos) {
+        ClearActiveFindMatch(editor);
+        editor.status = "No matches";
+        editor.last_action = "Find failed";
+        return false;
+    }
+
+    SelectFindMatch(editor, found, needle.size(), forward ? "Find next" : "Find previous");
+    return true;
 }
 
 bool PickOpenPath(GLFWwindow* window, std::filesystem::path& path) {
@@ -1239,115 +1657,484 @@ void DrawLineNumberGutter(EditorState& editor, ImVec2 pos, float height, float w
     draw_list->PopClipRect();
 }
 
-void ExecuteEditorCommand(EditorState& editor, ImGuiID text_id) {
+std::vector<VisualRow> BuildVisualRows(const Document& document, bool word_wrap, float wrap_width, float line_height) {
+    std::vector<VisualRow> rows;
+    rows.reserve(document.lines.size());
+
+    float y = 0.0f;
+    ImFont* font = ImGui::GetFont();
+    const float font_size = ImGui::GetFontSize();
+
+    for (int line_index = 0; line_index < static_cast<int>(document.lines.size()); ++line_index) {
+        const std::string& line = document.lines[static_cast<size_t>(line_index)];
+        if (line.empty() || !word_wrap || wrap_width <= 1.0f) {
+            rows.push_back(VisualRow{line_index, 0, line.size(), y});
+            y += line_height;
+            continue;
+        }
+
+        const char* line_begin = line.data();
+        const char* cursor = line_begin;
+        const char* line_end = line_begin + line.size();
+        while (cursor < line_end) {
+            const char* wrap_end = ImFontCalcWordWrapPositionEx(font, font_size, cursor, line_end, wrap_width);
+            if (wrap_end <= cursor) {
+                wrap_end = cursor + 1;
+            }
+
+            rows.push_back(VisualRow{
+                line_index,
+                static_cast<size_t>(cursor - line_begin),
+                static_cast<size_t>(wrap_end - line_begin),
+                y,
+            });
+            y += line_height;
+            cursor = wrap_end;
+
+            while (cursor < line_end && (*cursor == ' ' || *cursor == '\t')) {
+                ++cursor;
+            }
+        }
+    }
+
+    if (rows.empty()) {
+        rows.push_back(VisualRow{0, 0, 0, 0.0f});
+    }
+    return rows;
+}
+
+float MeasureTextRange(const std::string& text, size_t start, size_t end) {
+    start = (std::min)(start, text.size());
+    end = (std::min)(end, text.size());
+    if (end <= start) {
+        return 0.0f;
+    }
+
+    return ImGui::CalcTextSize(text.data() + start, text.data() + end).x;
+}
+
+size_t ColumnFromVisualX(const std::string& line, const VisualRow& row, float x) {
+    if (x <= 0.0f || row.end <= row.start) {
+        return row.start;
+    }
+
+    size_t best_column = row.start;
+    float best_distance = (std::numeric_limits<float>::max)();
+    for (size_t column = row.start; column <= row.end; column = NextCharacterPosition(line, column)) {
+        const float width = MeasureTextRange(line, row.start, column);
+        const float distance = std::fabs(width - x);
+        if (distance < best_distance) {
+            best_distance = distance;
+            best_column = column;
+        }
+        if (width > x && column > row.start) {
+            break;
+        }
+        if (column == row.end) {
+            break;
+        }
+    }
+
+    return best_column;
+}
+
+size_t PositionFromMouse(const EditorState& editor, const std::vector<VisualRow>& rows, ImVec2 origin, float gutter_width, float line_height) {
+    if (rows.empty()) {
+        return 0;
+    }
+
+    const ImVec2 mouse = ImGui::GetIO().MousePos;
+    const float local_y = mouse.y - origin.y;
+    int row_index = 0;
+    if (local_y > 0.0f) {
+        row_index = static_cast<int>(local_y / line_height);
+    }
+    row_index = std::clamp(row_index, 0, static_cast<int>(rows.size()) - 1);
+
+    const VisualRow& row = rows[static_cast<size_t>(row_index)];
+    const std::string& line = editor.document.lines[static_cast<size_t>(row.line)];
+    const float local_x = mouse.x - (origin.x + gutter_width);
+    const size_t column = ColumnFromVisualX(line, row, local_x);
+    return editor.document.PositionFromLineColumn(static_cast<size_t>(row.line), column);
+}
+
+size_t CursorVisualRowIndex(const EditorState& editor, const std::vector<VisualRow>& rows) {
+    const auto [line_index, column] = editor.document.LineColumnFromPosition(static_cast<size_t>(editor.cursor_pos));
+    for (size_t row_index = 0; row_index < rows.size(); ++row_index) {
+        const VisualRow& row = rows[row_index];
+        if (static_cast<size_t>(row.line) != line_index) {
+            continue;
+        }
+        if (column >= row.start && column <= row.end) {
+            return row_index;
+        }
+    }
+
+    return rows.empty() ? 0 : rows.size() - 1;
+}
+
+void EnsureCursorVisible(const EditorState& editor, const std::vector<VisualRow>& rows, float line_height, float padding_y) {
+    if (rows.empty()) {
+        return;
+    }
+
+    const VisualRow& row = rows[CursorVisualRowIndex(editor, rows)];
+    const float scroll_y = ImGui::GetScrollY();
+    const float visible_height = ImGui::GetWindowHeight();
+    if (row.y < scroll_y) {
+        ImGui::SetScrollY((std::max)(0.0f, row.y));
+    } else if (row.y + line_height + padding_y * 2.0f > scroll_y + visible_height) {
+        ImGui::SetScrollY(row.y + line_height + padding_y * 2.0f - visible_height);
+    }
+}
+
+void DrawSelectionForRow(
+    const EditorState& editor,
+    const VisualRow& row,
+    ImDrawList* draw_list,
+    ImVec2 text_pos,
+    float line_height) {
+    if (!HasSelection(editor)) {
+        return;
+    }
+
+    const auto [selection_start, selection_end] = NormalizedSelection(editor);
+    const size_t row_start = editor.document.PositionFromLineColumn(static_cast<size_t>(row.line), row.start);
+    const size_t row_end = editor.document.PositionFromLineColumn(static_cast<size_t>(row.line), row.end);
+    const size_t highlight_start = (std::max)(static_cast<size_t>(selection_start), row_start);
+    const size_t highlight_end = (std::min)(static_cast<size_t>(selection_end), row_end);
+    if (highlight_start >= highlight_end) {
+        return;
+    }
+
+    const std::string& line = editor.document.lines[static_cast<size_t>(row.line)];
+    const size_t line_start = editor.document.LineStartByIndex(static_cast<size_t>(row.line));
+    const size_t start_column = highlight_start - line_start;
+    const size_t end_column = highlight_end - line_start;
+    const float start_x = text_pos.x + MeasureTextRange(line, row.start, start_column);
+    const float end_x = text_pos.x + MeasureTextRange(line, row.start, end_column);
+    draw_list->AddRectFilled(
+        ImVec2(start_x, text_pos.y),
+        ImVec2((std::max)(start_x + 1.0f, end_x), text_pos.y + line_height),
+        ImGui::GetColorU32(ImGuiCol_TextSelectedBg));
+}
+
+void DrawFindHighlightsForRow(
+    const EditorState& editor,
+    const VisualRow& row,
+    ImDrawList* draw_list,
+    ImVec2 text_pos,
+    float line_height) {
+    const std::string needle = editor.find_buffer.data();
+    if (needle.empty()) {
+        return;
+    }
+
+    if (row.start >= row.end) {
+        return;
+    }
+
+    const std::string& line = editor.document.lines[static_cast<size_t>(row.line)];
+    const ImU32 color = ImGui::GetColorU32(ImVec4(0.85f, 0.65f, 0.18f, 0.35f));
+
+    size_t match = FindForwardFrom(line, needle, row.start, editor.find_match_case);
+    while (match != std::string::npos && match < row.end) {
+        const size_t match_end = match + needle.size();
+        const size_t highlight_start = (std::max)(match, row.start);
+        const size_t highlight_end = (std::min)(match_end, row.end);
+        if (highlight_start < highlight_end) {
+            const float start_x = text_pos.x + MeasureTextRange(line, row.start, highlight_start);
+            const float end_x = text_pos.x + MeasureTextRange(line, row.start, highlight_end);
+            draw_list->AddRectFilled(
+                ImVec2(start_x, text_pos.y),
+                ImVec2((std::max)(start_x + 1.0f, end_x), text_pos.y + line_height),
+                color);
+        }
+
+        match = FindForwardFrom(line, needle, match + 1, editor.find_match_case);
+    }
+}
+
+void MoveCursorVertical(EditorState& editor, int delta, bool selecting) {
+    const auto [line_index, column] = editor.document.LineColumnFromPosition(static_cast<size_t>(editor.cursor_pos));
+    if (editor.desired_column == 0 && column != 0) {
+        editor.desired_column = column;
+    }
+
+    const int target_line = std::clamp(
+        static_cast<int>(line_index) + delta,
+        0,
+        (std::max)(0, editor.document.LineCount() - 1));
+    const size_t target = editor.document.PositionFromLineColumn(
+        static_cast<size_t>(target_line),
+        editor.desired_column);
+    MoveCursorTo(editor, target, selecting, true);
+}
+
+void HandleCustomEditorKeyboard(EditorState& editor) {
+    if (!editor.editor_focused || EditorInputBlockedByDialog(editor) || ImGui::IsAnyItemActive()) {
+        return;
+    }
+
+    ImGuiIO& io = ImGui::GetIO();
+    const bool selecting = io.KeyShift;
+
+    if (io.KeyCtrl) {
+        if (ImGui::IsKeyPressed(ImGuiKey_C, false)) {
+            CopySelection(editor);
+        } else if (ImGui::IsKeyPressed(ImGuiKey_X, false)) {
+            CutSelection(editor);
+        } else if (ImGui::IsKeyPressed(ImGuiKey_V, false)) {
+            PasteClipboard(editor);
+        }
+        return;
+    }
+
+    if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow, true)) {
+        MoveCursorTo(editor, PreviousCharacterPosition(editor.document.text, static_cast<size_t>(editor.cursor_pos)), selecting);
+    } else if (ImGui::IsKeyPressed(ImGuiKey_RightArrow, true)) {
+        MoveCursorTo(editor, NextCharacterPosition(editor.document.text, static_cast<size_t>(editor.cursor_pos)), selecting);
+    } else if (ImGui::IsKeyPressed(ImGuiKey_UpArrow, true)) {
+        MoveCursorVertical(editor, -1, selecting);
+    } else if (ImGui::IsKeyPressed(ImGuiKey_DownArrow, true)) {
+        MoveCursorVertical(editor, 1, selecting);
+    } else if (ImGui::IsKeyPressed(ImGuiKey_Home, true)) {
+        const auto [line_index, column] = editor.document.LineColumnFromPosition(static_cast<size_t>(editor.cursor_pos));
+        (void)column;
+        MoveCursorTo(editor, editor.document.PositionFromLineColumn(line_index, 0), selecting);
+    } else if (ImGui::IsKeyPressed(ImGuiKey_End, true)) {
+        const auto [line_index, column] = editor.document.LineColumnFromPosition(static_cast<size_t>(editor.cursor_pos));
+        (void)column;
+        MoveCursorTo(
+            editor,
+            editor.document.PositionFromLineColumn(line_index, editor.document.lines[line_index].size()),
+            selecting);
+    } else if (ImGui::IsKeyPressed(ImGuiKey_Backspace, true)) {
+        DeleteBackward(editor);
+    } else if (ImGui::IsKeyPressed(ImGuiKey_Delete, true)) {
+        DeleteForward(editor);
+    } else if (ImGui::IsKeyPressed(ImGuiKey_Enter, true) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, true)) {
+        InsertTextAtCursor(editor, "\n", "Inserted newline");
+    } else if (ImGui::IsKeyPressed(ImGuiKey_Tab, true)) {
+        InsertTextAtCursor(editor, "    ", "Inserted tab");
+    }
+
+    std::string typed;
+    for (int i = 0; i < io.InputQueueCharacters.Size; ++i) {
+        const ImWchar character = io.InputQueueCharacters[i];
+        if (character < 32 || character == 127) {
+            continue;
+        }
+
+        char buffer[5] = {};
+        const int length = ImTextCharToUtf8(buffer, static_cast<unsigned int>(character));
+        if (length > 0) {
+            typed.append(buffer, static_cast<size_t>(length));
+        }
+    }
+
+    if (!typed.empty()) {
+        InsertTextAtCursor(editor, typed, "Typed");
+        io.InputQueueCharacters.resize(0);
+    }
+}
+
+void DrawCustomEditorSurface(EditorState& editor, ImVec2 size, float gutter_width) {
+    const ImGuiStyle& style = ImGui::GetStyle();
+    ImVec2 resolved_size = size;
+    const ImVec2 available_region = ImGui::GetContentRegionAvail();
+    if (resolved_size.x <= 0.0f) {
+        resolved_size.x = available_region.x;
+    }
+    if (resolved_size.y <= 0.0f) {
+        resolved_size.y = available_region.y;
+    }
+
+    const float line_height = ImGui::GetTextLineHeight();
+    const float padding_x = style.FramePadding.x;
+    const float padding_y = style.FramePadding.y;
+    const float available_width = (std::max)(1.0f, resolved_size.x - gutter_width - padding_x * 2.0f - style.ScrollbarSize);
+    std::vector<VisualRow> rows = BuildVisualRows(editor.document, editor.word_wrap, available_width, line_height);
+
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
+    ImGui::BeginChild("##custom_text_editor", resolved_size, false, ImGuiWindowFlags_AlwaysVerticalScrollbar | ImGuiWindowFlags_HorizontalScrollbar);
+
+    ImGuiWindow* window = ImGui::GetCurrentWindow();
+    ImDrawList* draw_list = ImGui::GetWindowDrawList();
+    ImVec2 origin(
+        window->Pos.x + padding_x - ImGui::GetScrollX(),
+        window->Pos.y + padding_y - ImGui::GetScrollY());
+    float scroll_y = ImGui::GetScrollY();
+    float visible_bottom = scroll_y + ImGui::GetWindowHeight();
+    const ImU32 text_color = ImGui::GetColorU32(ImGuiCol_Text);
+    const ImU32 gutter_text_color = ImGui::GetColorU32(ImGuiCol_TextDisabled);
+    const ImU32 border_color = ImGui::GetColorU32(ImGuiCol_Border);
+    const size_t revision_before_input = editor.document.edit_revision;
+
+    const bool hovered = ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem);
+    if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        if (hovered) {
+            editor.editor_focused = true;
+            const size_t clicked_position = PositionFromMouse(editor, rows, origin, gutter_width, line_height);
+            if (ImGui::GetIO().KeyShift) {
+                SetSelection(editor, static_cast<size_t>(editor.cursor_pos), clicked_position);
+            } else {
+                MoveCursorTo(editor, clicked_position, false);
+                editor.mouse_selection_anchor = clicked_position;
+            }
+            editor.dragging_selection = true;
+        } else if (!ImGui::IsAnyItemHovered()) {
+            editor.editor_focused = false;
+        }
+    }
+
+    if (editor.dragging_selection && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        const size_t drag_position = PositionFromMouse(editor, rows, origin, gutter_width, line_height);
+        SetSelection(editor, editor.mouse_selection_anchor, drag_position);
+    }
+    if (ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+        editor.dragging_selection = false;
+    }
+
+    HandleCustomEditorKeyboard(editor);
+    if (editor.document.edit_revision != revision_before_input) {
+        rows = BuildVisualRows(editor.document, editor.word_wrap, available_width, line_height);
+    }
+
+    EnsureCursorVisible(editor, rows, line_height, padding_y);
+    origin = ImVec2(
+        window->Pos.x + padding_x - ImGui::GetScrollX(),
+        window->Pos.y + padding_y - ImGui::GetScrollY());
+    scroll_y = ImGui::GetScrollY();
+    visible_bottom = scroll_y + ImGui::GetWindowHeight();
+    const float content_height = rows.empty() ? line_height : rows.back().y + line_height + padding_y * 2.0f;
+
+    draw_list->PushClipRect(window->InnerClipRect.Min, window->InnerClipRect.Max, true);
+
+    if (editor.show_line_numbers) {
+        const float gutter_right = window->Pos.x + gutter_width;
+        draw_list->AddLine(ImVec2(gutter_right - 1.0f, window->InnerClipRect.Min.y), ImVec2(gutter_right - 1.0f, window->InnerClipRect.Max.y), border_color);
+    }
+
+    auto first_row = std::lower_bound(
+        rows.begin(),
+        rows.end(),
+        (std::max)(0.0f, scroll_y - line_height),
+        [](const VisualRow& row, float y) {
+            return row.y < y;
+        });
+
+    int last_drawn_line = -1;
+    for (auto it = first_row; it != rows.end(); ++it) {
+        if (it->y > visible_bottom) {
+            break;
+        }
+
+        const std::string& line = editor.document.lines[static_cast<size_t>(it->line)];
+        const float screen_y = origin.y + it->y;
+        if (editor.show_line_numbers && it->line != last_drawn_line) {
+            const std::string number = std::to_string(it->line + 1);
+            const ImVec2 number_size = ImGui::CalcTextSize(number.c_str());
+            draw_list->AddText(
+                ImVec2(window->Pos.x + gutter_width - padding_x - number_size.x - 2.0f, screen_y),
+                gutter_text_color,
+                number.c_str());
+            last_drawn_line = it->line;
+        }
+
+        const char* text_begin = line.data() + it->start;
+        const char* text_end = line.data() + it->end;
+        const ImVec2 text_pos(origin.x + gutter_width, screen_y);
+        DrawFindHighlightsForRow(editor, *it, draw_list, text_pos, line_height);
+        DrawSelectionForRow(editor, *it, draw_list, text_pos, line_height);
+        draw_list->AddText(text_pos, text_color, text_begin, text_end);
+    }
+
+    if (editor.editor_focused && rows.size() > 0) {
+        const size_t cursor_row_index = CursorVisualRowIndex(editor, rows);
+        const VisualRow& cursor_row = rows[cursor_row_index];
+        const auto [line_index, column] = editor.document.LineColumnFromPosition(static_cast<size_t>(editor.cursor_pos));
+        const std::string& line = editor.document.lines[line_index];
+        const float cursor_x = origin.x + gutter_width + MeasureTextRange(line, cursor_row.start, column);
+        const float cursor_y = origin.y + cursor_row.y;
+        const bool cursor_visible = std::fmod(static_cast<float>(ImGui::GetTime()), 1.2f) < 0.8f;
+        if (cursor_visible && cursor_y + line_height >= window->InnerClipRect.Min.y && cursor_y <= window->InnerClipRect.Max.y) {
+            draw_list->AddLine(
+                ImVec2(cursor_x, cursor_y),
+                ImVec2(cursor_x, cursor_y + line_height),
+                text_color,
+                1.0f);
+        }
+    }
+
+    draw_list->PopClipRect();
+
+    const float content_width = editor.word_wrap
+        ? (std::max)(available_width + gutter_width, ImGui::GetContentRegionAvail().x)
+        : 2400.0f;
+    ImGui::Dummy(ImVec2(content_width, content_height));
+    editor.editor_scroll_y = scroll_y;
+
+    ImGui::EndChild();
+    ImGui::PopStyleColor();
+}
+
+void ExecuteEditorCommand(EditorState& editor) {
     const EditorCommand command = editor.pending_editor_command;
     editor.pending_editor_command = EditorCommand::None;
     if (command == EditorCommand::None) {
         return;
     }
 
-    ImGuiInputTextState* state = ImGui::GetInputTextState(text_id);
-
     switch (command) {
     case EditorCommand::None:
         break;
     case EditorCommand::Undo:
         if (!editor.undo_stack.empty()) {
-            editor.redo_stack.push_back(editor.document.text);
-            std::string previous = std::move(editor.undo_stack.back());
+            editor.redo_stack.push_back(MakeEditorSnapshot(editor));
+            EditorSnapshot previous = std::move(editor.undo_stack.back());
             editor.undo_stack.pop_back();
-            SetDocumentTextFromCommand(editor, std::move(previous), editor.cursor_pos, state);
+            ApplyEditorSnapshot(editor, previous);
+            editor.status = "Editing";
         }
         editor.last_action = "Undo";
         break;
     case EditorCommand::Redo:
         if (!editor.redo_stack.empty()) {
-            editor.undo_stack.push_back(editor.document.text);
-            std::string next = std::move(editor.redo_stack.back());
+            PushUndoSnapshot(editor, MakeEditorSnapshot(editor));
+            EditorSnapshot next = std::move(editor.redo_stack.back());
             editor.redo_stack.pop_back();
-            SetDocumentTextFromCommand(editor, std::move(next), editor.cursor_pos, state);
+            ApplyEditorSnapshot(editor, next);
+            editor.status = "Editing";
         }
         editor.last_action = "Redo";
         break;
     case EditorCommand::Cut:
-        if (editor.has_selection) {
-            const auto [selection_start, selection_end] = NormalizedSelection(editor);
-            ImGui::SetClipboardText(editor.document.text.substr(
-                static_cast<size_t>(selection_start),
-                static_cast<size_t>(selection_end - selection_start)).c_str());
-            RecordUndoSnapshot(editor, editor.document.text);
-            std::string next = editor.document.text;
-            next.erase(static_cast<size_t>(selection_start), static_cast<size_t>(selection_end - selection_start));
-            SetDocumentTextFromCommand(editor, std::move(next), selection_start, state);
-            editor.last_action = "Cut";
-        }
+        CutSelection(editor);
         break;
     case EditorCommand::Copy:
-        if (editor.has_selection) {
-            const auto [selection_start, selection_end] = NormalizedSelection(editor);
-            ImGui::SetClipboardText(editor.document.text.substr(
-                static_cast<size_t>(selection_start),
-                static_cast<size_t>(selection_end - selection_start)).c_str());
-            editor.status = "Copied";
-            editor.last_action = "Copied";
-        }
+        CopySelection(editor);
         break;
     case EditorCommand::Paste:
-        {
-            const std::string pasted = NormalizePlainText(ImGui::GetClipboardText());
-            int selection_start = editor.cursor_pos;
-            int selection_end = editor.cursor_pos;
-            if (editor.has_selection) {
-                const auto selection = NormalizedSelection(editor);
-                selection_start = selection.first;
-                selection_end = selection.second;
-            }
-
-            RecordUndoSnapshot(editor, editor.document.text);
-            std::string next = editor.document.text;
-            next.replace(
-                static_cast<size_t>(selection_start),
-                static_cast<size_t>(selection_end - selection_start),
-                pasted);
-            SetDocumentTextFromCommand(editor, std::move(next), selection_start + static_cast<int>(pasted.size()), state);
-        }
-        editor.last_action = "Pasted";
+        PasteClipboard(editor);
         break;
     case EditorCommand::InsertText:
-        {
-            int selection_start = editor.cursor_pos;
-            int selection_end = editor.cursor_pos;
-            if (editor.has_selection) {
-                const auto selection = NormalizedSelection(editor);
-                selection_start = selection.first;
-                selection_end = selection.second;
-            }
-
-            RecordUndoSnapshot(editor, editor.document.text);
-            std::string next = editor.document.text;
-            next.replace(
-                static_cast<size_t>(selection_start),
-                static_cast<size_t>(selection_end - selection_start),
-                editor.pending_insert_text);
-            SetDocumentTextFromCommand(
-                editor,
-                std::move(next),
-                selection_start + static_cast<int>(editor.pending_insert_text.size()),
-                state);
-            editor.pending_insert_text.clear();
-        }
-        editor.last_action = "Inserted generated password";
+        InsertTextAtCursor(editor, editor.pending_insert_text, "Inserted generated password");
+        editor.pending_insert_text.clear();
         break;
     case EditorCommand::SelectAll:
-        if (state != nullptr) {
-            state->SelectAll();
-            state->CursorAnimReset();
-        }
         editor.selection_start = 0;
         editor.selection_end = static_cast<int>(editor.document.text.size());
         editor.has_selection = !editor.document.text.empty();
+        SetCursorPosition(editor, editor.document.text.size());
         editor.status = "Selected all";
         editor.last_action = "Selected all";
+        break;
+    case EditorCommand::FindNext:
+        FindInDocument(editor, true);
+        break;
+    case EditorCommand::FindPrevious:
+        FindInDocument(editor, false);
         break;
     }
 }
@@ -1401,6 +2188,16 @@ void DrawMenuBar(EditorState& editor, GLFWwindow* window) {
         if (ImGui::MenuItem("Select All", "Ctrl+A")) {
             QueueEditorCommand(editor, EditorCommand::SelectAll);
         }
+        ImGui::Separator();
+        if (ImGui::MenuItem("Find", "Ctrl+F")) {
+            editor.show_find_window = true;
+        }
+        if (ImGui::MenuItem("Find Next", "F3")) {
+            QueueEditorCommand(editor, EditorCommand::FindNext);
+        }
+        if (ImGui::MenuItem("Find Previous", "Shift+F3")) {
+            QueueEditorCommand(editor, EditorCommand::FindPrevious);
+        }
         ImGui::EndMenu();
     }
 
@@ -1421,8 +2218,15 @@ void DrawMenuBar(EditorState& editor, GLFWwindow* window) {
 }
 
 void HandleShortcuts(EditorState& editor, GLFWwindow* window) {
+    if (EditorInputBlockedByDialog(editor)) {
+        return;
+    }
+
     ImGuiIO& io = ImGui::GetIO();
     if (!io.KeyCtrl) {
+        if (ImGui::IsKeyPressed(ImGuiKey_F3, false)) {
+            QueueEditorCommand(editor, io.KeyShift ? EditorCommand::FindPrevious : EditorCommand::FindNext);
+        }
         return;
     }
 
@@ -1442,9 +2246,64 @@ void HandleShortcuts(EditorState& editor, GLFWwindow* window) {
         QueueEditorCommand(editor, EditorCommand::Redo);
     } else if (ImGui::IsKeyPressed(ImGuiKey_A, false)) {
         QueueEditorCommand(editor, EditorCommand::SelectAll);
+    } else if (ImGui::IsKeyPressed(ImGuiKey_F, false)) {
+        editor.show_find_window = true;
     } else if (ImGui::IsKeyPressed(ImGuiKey_P, false)) {
         editor.show_password_generator = true;
     }
+}
+
+void DrawFindWindow(EditorState& editor) {
+    if (!editor.show_find_window) {
+        return;
+    }
+
+    ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(
+        ImVec2(viewport->WorkPos.x + viewport->WorkSize.x - 360.0f, viewport->WorkPos.y + 36.0f),
+        ImGuiCond_Appearing);
+    ImGui::SetNextWindowSize(ImVec2(340.0f, 0.0f), ImGuiCond_Appearing);
+
+    bool open = editor.show_find_window;
+    if (!ImGui::Begin("Find", &open, ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize)) {
+        editor.show_find_window = open;
+        ImGui::End();
+        return;
+    }
+
+    if (ImGui::IsWindowAppearing()) {
+        ImGui::SetKeyboardFocusHere();
+    }
+
+    const bool submitted = ImGui::InputText(
+        "Text",
+        editor.find_buffer.data(),
+        editor.find_buffer.size(),
+        ImGuiInputTextFlags_EnterReturnsTrue);
+
+    ImGui::Checkbox("Match case", &editor.find_match_case);
+    ImGui::SameLine();
+    ImGui::Checkbox("Wrap", &editor.find_wrap);
+
+    if (submitted) {
+        QueueEditorCommand(editor, ImGui::GetIO().KeyShift ? EditorCommand::FindPrevious : EditorCommand::FindNext);
+    }
+
+    if (ImGui::Button("Previous")) {
+        QueueEditorCommand(editor, EditorCommand::FindPrevious);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Next")) {
+        QueueEditorCommand(editor, EditorCommand::FindNext);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Close") || ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+        open = false;
+        ClearActiveFindMatch(editor);
+    }
+
+    editor.show_find_window = open;
+    ImGui::End();
 }
 
 void DrawEditor(EditorState& editor) {
@@ -1467,90 +2326,8 @@ void DrawEditor(EditorState& editor) {
         : 0.0f;
     const float editor_height = ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing();
 
-    InputCallbackState callback_state{
-        .document = &editor.document,
-        .editor = &editor,
-    };
-
-    ImGuiInputTextFlags flags =
-        ImGuiInputTextFlags_AllowTabInput |
-        ImGuiInputTextFlags_NoUndoRedo |
-        ImGuiInputTextFlags_CallbackResize |
-        ImGuiInputTextFlags_CallbackAlways;
-
-    const ImVec2 gutter_pos = ImGui::GetCursorScreenPos();
-    if (editor.show_line_numbers) {
-        ImGui::InvisibleButton("##line_numbers", ImVec2(gutter_width, editor_height));
-        ImGui::SameLine(0.0f, 0.0f);
-    }
-
-    const char* text_label = "##text";
-    const ImGuiID text_id = ImGui::GetID(text_label);
-    char text_child_name[256]{};
-    ImFormatString(
-        text_child_name,
-        IM_ARRAYSIZE(text_child_name),
-        "%s/%s_%08X",
-        ImGui::GetCurrentWindow()->Name,
-        text_label,
-        text_id);
-    ImVec2 editor_size(-1.0f, editor_height);
-    const float text_wrap_width = (std::max)(1.0f, ImGui::GetContentRegionAvail().x - ImGui::GetStyle().FramePadding.x * 2.0f);
-
-    if (editor.word_wrap) {
-        flags |= ImGuiInputTextFlags_WordWrap | ImGuiInputTextFlags_NoHorizontalScroll;
-        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x);
-    }
-
-    ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_NavCursor, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
-    if (editor.pending_editor_command != EditorCommand::None) {
-        ImGui::SetKeyboardFocusHere();
-    }
-    const bool capture_undo_snapshot = ImGui::GetActiveID() == text_id;
-    const std::string previous_text = capture_undo_snapshot ? editor.document.text : std::string();
-    const bool changed = ImGui::InputTextMultiline(
-        text_label,
-        editor.document.text.data(),
-        editor.document.text.capacity() + 1,
-        editor_size,
-        flags,
-        TextInputCallback,
-        &callback_state);
-    ImGui::PopStyleColor(3);
-
-    if (changed) {
-        if (capture_undo_snapshot) {
-            RecordUndoSnapshot(editor, previous_text);
-        }
-        editor.document.MarkEdited();
-        editor.status = "Editing";
-        editor.last_action = "Modified";
-    }
-
-    if (ImGuiWindow* input_window = ImGui::FindWindowByName(text_child_name)) {
-        editor.editor_scroll_y = input_window->Scroll.y;
-    } else if (ImGuiInputTextState* input_state = ImGui::GetInputTextState(text_id)) {
-        editor.editor_scroll_y = input_state->Scroll.y;
-    }
-
-    if (ImGuiInputTextState* input_state = ImGui::GetInputTextState(text_id)) {
-        UpdateCursorPosition(editor, input_state->GetCursorPos());
-        editor.selection_start = input_state->GetSelectionStart();
-        editor.selection_end = input_state->GetSelectionEnd();
-        editor.has_selection = input_state->HasSelection();
-    }
-
-    ExecuteEditorCommand(editor, text_id);
-
-    if (editor.show_line_numbers) {
-        DrawLineNumberGutter(editor, gutter_pos, editor_height, gutter_width, text_wrap_width);
-    }
-
-    if (editor.word_wrap) {
-        ImGui::PopTextWrapPos();
-    }
+    ExecuteEditorCommand(editor);
+    DrawCustomEditorSurface(editor, ImVec2(-1.0f, editor_height), gutter_width);
 
     const std::string name = editor.file_path.empty()
         ? std::string("Untitled")
@@ -1702,6 +2479,7 @@ int main() {
             CompletePendingAction(editor, window);
         }
         DrawEditor(editor);
+        DrawFindWindow(editor);
         DrawUnsavedPrompt(editor, window);
         DrawPasswordPrompt(editor, window);
         DrawPasswordGenerator(editor);
